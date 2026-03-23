@@ -47,6 +47,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiButton;
 import net.minecraft.client.renderer.RenderHelper;
 import net.minecraft.client.settings.KeyBinding;
+import net.minecraft.client.shader.Framebuffer;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.util.EnumChatFormatting;
 import net.minecraft.util.MathHelper;
@@ -54,6 +55,7 @@ import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.Logger;
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
+import org.lwjgl.opengl.GL11;
 
 import java.awt.geom.Point2D;
 import java.util.Arrays;
@@ -119,13 +121,15 @@ public class Fullscreen extends JmUI
         buttonList.clear();
     }
 
+    Framebuffer mapBuffer;
+    boolean bufferDirty = true;
+
     @Override
     public void initGui()
     {
         fullMapProperties = JourneymapClient.getFullMapProperties();
         Keyboard.enableRepeatEvents(true);
 
-        // When switching dimensions, reset grid
         if (state.getCurrentMapType().dimension != mc.thePlayer.dimension)
         {
             gridRenderer.clear();
@@ -133,7 +137,19 @@ public class Fullscreen extends JmUI
 
         initButtons();
 
-        // Check for first-time use
+        // 🔥 ИНИЦИАЛИЗАЦИЯ FBO
+        if (mapBuffer == null || mapBuffer.framebufferWidth != mc.displayWidth || mapBuffer.framebufferHeight != mc.displayHeight)
+        {
+            if (mapBuffer != null)
+            {
+                mapBuffer.deleteFramebuffer();
+            }
+
+            mapBuffer = new Framebuffer(mc.displayWidth, mc.displayHeight, true);
+            mapBuffer.setFramebufferColor(0f, 0f, 0f, 0f);
+            bufferDirty = true;
+        }
+
         if (!JourneymapClient.getCoreProperties().splashViewed.get().equals(Journeymap.JM_VERSION.toString()))
         {
             UIManager.getInstance().openSplash(this);
@@ -647,54 +663,67 @@ public class Fullscreen extends JmUI
         layerDelegate.onMouseClicked(mc, Mouse.getEventX(), Mouse.getEventY(), gridRenderer.getWidth(), gridRenderer.getHeight(), blockCoord, mouseButton);
     }
 
+    float pixelOffsetX = 0f;
+    float pixelOffsetY = 0f;
+
     @Override
     protected void mouseMovedOrUp(int mouseX, int mouseY, int which)
     {
         super.mouseMovedOrUp(mouseX, mouseY, which);
 
-        if (isMouseOverButton(mouseX, mouseY))
-        {
-            return;
-        }
+        if (isMouseOverButton(mouseX, mouseY)) return;
 
         int blockSize = (int) Math.pow(2, fullMapProperties.zoomLevel.get());
 
-        if (Mouse.isButtonDown(0) && !isScrolling)
+        if (Mouse.isButtonDown(0))
         {
-            isScrolling = true;
+            if (!isScrolling)
+            {
+                isScrolling = true;
+                msx = mx;
+                msy = my;
+            }
+
+            float dx = mx - msx;
+            float dy = my - msy;
+
+            pixelOffsetX += dx;
+            pixelOffsetY += dy;
+
             msx = mx;
             msy = my;
+
+            setFollow(false);
         }
         else
         {
-            if (!Mouse.isButtonDown(0) && isScrolling)
+            if (isScrolling)
             {
-                isScrolling = false;
-                int mouseDragX = (mx - msx) * Math.max(1, scaleFactor) / blockSize;
-                int mouseDragY = (my - msy) * Math.max(1, scaleFactor) / blockSize;
-                msx = mx;
-                msy = my;
+                int moveX = (int)(pixelOffsetX / blockSize);
+                int moveY = (int)(pixelOffsetY / blockSize);
 
-                try
+                if (moveX != 0 || moveY != 0)
                 {
-                    gridRenderer.move(-mouseDragX, -mouseDragY);
-                    gridRenderer.updateTiles(state.getCurrentMapType(), state.getZoom(), state.isHighQuality(), mc.displayWidth, mc.displayHeight, false, 0, 0);
-                    gridRenderer.setZoom(fullMapProperties.zoomLevel.get());
-                }
-                catch (Exception e)
-                {
-                    logger.error("Error moving grid: " + e);
-                }
+                    gridRenderer.move(-moveX, -moveY);
 
-                setFollow(false);
-                refreshState();
+                    // ❗ обновляем тайлы ТОЛЬКО если реально сдвинулись
+                    gridRenderer.updateTiles(
+                            state.getCurrentMapType(),
+                            state.getZoom(),
+                            state.isHighQuality(),
+                            mc.displayWidth,
+                            mc.displayHeight,
+                            false,
+                            0,
+                            0
+                    );
+
+                    pixelOffsetX -= moveX * blockSize;
+                    pixelOffsetY -= moveY * blockSize;
+                }
             }
-        }
 
-        if (!isScrolling && which == -1)
-        {
-            BlockCoordIntPair blockCoord = gridRenderer.getBlockUnderMouse(Mouse.getEventX(), Mouse.getEventY(), mc.displayWidth, mc.displayHeight);
-            layerDelegate.onMouseMove(mc, Mouse.getEventX(), Mouse.getEventY(), gridRenderer.getWidth(), gridRenderer.getHeight(), blockCoord);
+            isScrolling = false;
         }
     }
 
@@ -878,21 +907,11 @@ public class Fullscreen extends JmUI
         {
             sizeDisplay(false);
 
-            int xOffset = 0;
-            int yOffset = 0;
+            int xOffset = (int) pixelOffsetX;
+            int yOffset = (int) pixelOffsetY;
 
-            if (isScrolling)
-            {
-                int blockSize = (int) Math.pow(2, fullMapProperties.zoomLevel.get());
-
-                int mouseDragX = (mx - msx) * Math.max(1, scaleFactor) / blockSize;
-                int mouseDragY = (my - msy) * Math.max(1, scaleFactor) / blockSize;
-
-                xOffset = (mouseDragX * blockSize);
-                yOffset = (mouseDragY * blockSize);
-
-            }
-            else
+            // 🔥 НЕ обновляем карту во время перетаскивания
+            if (!isScrolling)
             {
                 if (refreshReady)
                 {
@@ -904,51 +923,81 @@ public class Fullscreen extends JmUI
                 }
             }
 
-            // Clear GL error queue of anything that happened before JM starts drawing, don't report them
             gridRenderer.clearGlErrors(false);
-
             gridRenderer.updateRotation(0);
+
             float drawScale = fullMapProperties.textureSmall.get() ? 1f : 2f;
 
+            // Центрирование игрока
             if (state.follow.get())
             {
-                gridRenderer.center(state.getCurrentMapType(), mc.thePlayer.posX, mc.thePlayer.posZ, fullMapProperties.zoomLevel.get());
-            }
-            gridRenderer.updateTiles(state.getCurrentMapType(), state.getZoom(), state.isHighQuality(), mc.displayWidth, mc.displayHeight, false, 0, 0);
-            gridRenderer.draw(1f, xOffset, yOffset, fullMapProperties.showGrid.get());
-            gridRenderer.draw(state.getDrawSteps(), xOffset, yOffset, drawScale, getMapFontScale(), 0);
-            gridRenderer.draw(state.getDrawWaypointSteps(), xOffset, yOffset, drawScale, getMapFontScale(), 0);
+                gridRenderer.center(
+                        state.getCurrentMapType(),
+                        mc.thePlayer.posX,
+                        mc.thePlayer.posZ,
+                        fullMapProperties.zoomLevel.get()
+                );
 
+                pixelOffsetX = 0;
+                pixelOffsetY = 0;
+                xOffset = 0;
+                yOffset = 0;
+            }
+
+            // ✅ МАГИЯ ПЛАВНОСТИ (OpenGL translate)
+            GL11.glPushMatrix();
+            GL11.glTranslatef(xOffset, yOffset, 0);
+
+            // 🔥 Рисуем БЕЗ смещения (оно уже в GL)
+            gridRenderer.draw(1f, 0, 0, fullMapProperties.showGrid.get());
+            gridRenderer.draw(state.getDrawSteps(), 0, 0, drawScale, getMapFontScale(), 0);
+            gridRenderer.draw(state.getDrawWaypointSteps(), 0, 0, drawScale, getMapFontScale(), 0);
+
+            // Игрок
             if (fullMapProperties.showSelf.get())
             {
                 Point2D playerPixel = gridRenderer.getPixel(mc.thePlayer.posX, mc.thePlayer.posZ);
                 if (playerPixel != null)
                 {
-                    DrawUtil.drawEntity(playerPixel.getX() + xOffset, playerPixel.getY() + yOffset, mc.thePlayer.rotationYawHead, false, TextureCache.instance().getPlayerLocatorSmall(), drawScale, 0);
+                    DrawUtil.drawEntity(
+                            playerPixel.getX(),
+                            playerPixel.getY(),
+                            mc.thePlayer.rotationYawHead,
+                            false,
+                            TextureCache.instance().getPlayerLocatorSmall(),
+                            drawScale,
+                            0
+                    );
                 }
             }
 
-            gridRenderer.draw(layerDelegate.getDrawSteps(), xOffset, yOffset, drawScale, getMapFontScale(), 0);
+            gridRenderer.draw(layerDelegate.getDrawSteps(), 0, 0, drawScale, getMapFontScale(), 0);
 
-            DrawUtil.drawLabel(state.playerLastPos, mc.displayWidth / 2, mc.displayHeight, DrawUtil.HAlign.Center, DrawUtil.VAlign.Above,
-                    statusBackgroundColor, statusBackgroundAlpha, statusForegroundColor, statusForegroundAlpha, getMapFontScale(), true);
+            GL11.glPopMatrix();
+
+            // UI рисуем БЕЗ translate
+            DrawUtil.drawLabel(
+                    state.playerLastPos,
+                    mc.displayWidth / 2,
+                    mc.displayHeight,
+                    DrawUtil.HAlign.Center,
+                    DrawUtil.VAlign.Above,
+                    statusBackgroundColor,
+                    statusBackgroundAlpha,
+                    statusForegroundColor,
+                    statusForegroundAlpha,
+                    getMapFontScale(),
+                    true
+            );
 
             drawLogo();
-
             sizeDisplay(true);
         }
         finally
         {
             timer.stop();
-
-            // Clear GL error queue of anything that happened during JM drawing and report them
             gridRenderer.clearGlErrors(true);
         }
-
-
-        //GridRenderer.addDebugMessage(timer.getName(), timer.getSimpleReportString());
-        //GridRenderer.addDebugMessage(StatTimer.get("GridRenderer.center").getName(), StatTimer.get("GridRenderer.center").getSimpleReportString());
-
     }
 
     private int getMapFontScale()
@@ -971,12 +1020,8 @@ public class Fullscreen extends JmUI
         }
     }
 
-    /**
-     * Get a snapshot of the player's biome, effective map state, etc.
-     */
     void refreshState()
     {
-        // Check player status
         EntityPlayer player = mc.thePlayer;
         if (player == null)
         {
@@ -984,47 +1029,65 @@ public class Fullscreen extends JmUI
             return;
         }
 
-        StatTimer timer = StatTimer.get("Fullscreen.refreshState");
-        timer.start();
-
-        // Update the state first
         fullMapProperties = JourneymapClient.getFullMapProperties();
         state.refresh(mc, player, fullMapProperties);
 
-        if (state.getCurrentMapType().dimension != mc.thePlayer.dimension)
+        if (state.getCurrentMapType().dimension != player.dimension)
         {
             setFollow(true);
         }
 
         gridRenderer.setContext(state.getWorldDir(), state.getCurrentMapType());
 
-        // Center core renderer
         if (state.follow.get())
         {
-            gridRenderer.center(state.getCurrentMapType(), mc.thePlayer.posX, mc.thePlayer.posZ, fullMapProperties.zoomLevel.get());
+            gridRenderer.center(
+                    state.getCurrentMapType(),
+                    player.posX,
+                    player.posZ,
+                    fullMapProperties.zoomLevel.get()
+            );
         }
         else
         {
             gridRenderer.setZoom(fullMapProperties.zoomLevel.get());
         }
 
-        // Update tiles
-        gridRenderer.updateTiles(state.getCurrentMapType(), state.getZoom(), state.isHighQuality(), mc.displayWidth, mc.displayHeight, true, 0, 0);
+        // 🔥 обновляем ТОЛЬКО при реальном refresh
+        gridRenderer.updateTiles(
+                state.getCurrentMapType(),
+                state.getZoom(),
+                state.isHighQuality(),
+                mc.displayWidth,
+                mc.displayHeight,
+                true,
+                0,
+                0
+        );
 
-        // Build list of drawSteps
-        state.generateDrawSteps(mc, gridRenderer, waypointRenderer, radarRenderer, fullMapProperties, 1f, false);
+        state.generateDrawSteps(
+                mc,
+                gridRenderer,
+                waypointRenderer,
+                radarRenderer,
+                fullMapProperties,
+                1f,
+                false
+        );
 
-        // Update player pos
         LocationFormat.LocationFormatKeys locationFormatKeys = locationFormat.getFormatKeys(fullMapProperties.locationFormat.get());
-        state.playerLastPos = locationFormatKeys.format(fullMapProperties.locationFormatVerbose.get(),
-                MathHelper.floor_double(mc.thePlayer.posX),
-                MathHelper.floor_double(mc.thePlayer.posZ),
-                MathHelper.floor_double(ForgeHelper.INSTANCE.getEntityBoundingBox(mc.thePlayer).minY),
-                mc.thePlayer.chunkCoordY) + " " + state.getPlayerBiome();
+        state.playerLastPos = locationFormatKeys.format(
+                fullMapProperties.locationFormatVerbose.get(),
+                MathHelper.floor_double(player.posX),
+                MathHelper.floor_double(player.posZ),
+                MathHelper.floor_double(ForgeHelper.INSTANCE.getEntityBoundingBox(player).minY),
+                player.chunkCoordY
+        ) + " " + state.getPlayerBiome();
 
-        // Reset timer
         state.updateLastRefresh();
-        timer.stop();
+
+        // 🔥 ВАЖНО
+        bufferDirty = true;
     }
 
     void openChat(String defaultText)
